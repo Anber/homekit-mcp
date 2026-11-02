@@ -1,24 +1,23 @@
 name: CI
 on:
   push:
-    branches: [master, 'anber/**']
+    branches: [master]
   pull_request:
     branches: [master]
   workflow_dispatch:
 permissions:
   contents: read
+concurrency:
+  group: homekit-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
 jobs:
-  security-tests:
+  verify:
+    name: Security tests and native build
     runs-on: macos-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - name: Production core and local transport tests (no HomeKit)
         run: make test
-  native-build:
-    runs-on: macos-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - name: Build actual Mac Catalyst application without signing or execution
         run: make build-unsigned
