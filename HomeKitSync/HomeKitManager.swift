@@ -15,15 +15,17 @@ import HomeKit
         pending.values.forEach { $0.resume() }
     }
     private func waitUntilReady() async throws {
-        if ready { return }
-        let id = UUID()
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            waiters[id] = continuation
-            Task { @MainActor [weak self] in
-                try? await Task.sleep(nanoseconds: 10_000_000_000)
-                self?.waiters.removeValue(forKey: id)?.resume(throwing: BridgeError("HomeKit is not ready; check local permission"))
+        if !ready {
+            let id = UUID()
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                waiters[id] = continuation
+                Task { @MainActor [weak self] in
+                    try? await Task.sleep(nanoseconds: 10_000_000_000)
+                    self?.waiters.removeValue(forKey: id)?.resume(throwing: BridgeError("HomeKit is not ready; check local permission"))
+                }
             }
         }
+        guard manager.authorizationStatus.contains(.authorized) else { throw BridgeError("HomeKit permission is not authorized") }
     }
     func homes() async throws -> [HomeSummary] {
         try await waitUntilReady()

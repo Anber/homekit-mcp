@@ -16,21 +16,24 @@ public enum PrivateStorage {
     }
     public static func readPolicy(_ directory: URL) throws -> AccessPolicy {
         try prepareDirectory(directory)
-        let file = directory.appendingPathComponent("policy.json")
+        let policy = try read(AccessPolicy.self, from: directory.appendingPathComponent("policy.json")) ?? AccessPolicy()
+        try policy.validate()
+        return policy
+    }
+    public static func read<T: Decodable>(_ type: T.Type, from file: URL, limit: Int64 = 131072) throws -> T? {
+        try prepareDirectory(file.deletingLastPathComponent())
         var info = stat()
         if lstat(file.path, &info) != 0 {
             guard errno == ENOENT else { throw BridgeError("Cannot inspect policy") }
-            return AccessPolicy()
+            return nil
         }
         guard info.st_mode & S_IFMT == S_IFREG, info.st_uid == geteuid(),
-              info.st_mode & 0o077 == 0, info.st_size <= 131072
+              info.st_mode & 0o077 == 0, info.st_size <= limit
         else { throw BridgeError("Policy must be an owned private regular file") }
         let fd = open(file.path, O_RDONLY | O_NOFOLLOW)
         guard fd >= 0 else { throw BridgeError("Cannot open policy") }
         let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
-        let policy = try JSONDecoder().decode(AccessPolicy.self, from: handle.readToEnd() ?? Data())
-        try policy.validate()
-        return policy
+        return try JSONDecoder().decode(type, from: handle.readToEnd() ?? Data())
     }
     public static func write<T: Encodable>(_ value: T, to file: URL) throws {
         try prepareDirectory(file.deletingLastPathComponent())

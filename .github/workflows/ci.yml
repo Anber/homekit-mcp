@@ -12,7 +12,7 @@ concurrency:
   cancel-in-progress: true
 jobs:
   verify:
-    name: Security tests and native build
+    name: Security, background lifecycle and native build
     runs-on: macos-latest
     timeout-minutes: 15
     steps:

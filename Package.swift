@@ -8,7 +8,7 @@ let package = Package(
     targets: [
         .target(name: "HomeKitMCPCore", path: "HomeKitSync",
                 exclude: ["MCPApp.swift", "HomeKitManager.swift", "Info.plist", "HomeKitSync.entitlements"],
-                sources: ["MCPServer.swift", "HTTPMCPServer.swift"]),
+                sources: ["MCPServer.swift", "HTTPMCPServer.swift", "BridgeLifecycle.swift"]),
         .executableTarget(name: "HomeKitMCPFixture", dependencies: ["HomeKitMCPCore"], path: "Tests/Fixtures"),
         .testTarget(name: "HomeKitMCPCoreTests", dependencies: ["HomeKitMCPCore"], path: "Tests/HomeKitMCPCoreTests")
     ]

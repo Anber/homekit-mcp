@@ -20,7 +20,13 @@ Bulk plans are best-effort sequential metadata updates, not a transaction. Fresh
 
 ## Transport
 
-One user-owned AF_UNIX endpoint, same-UID peer validation, four concurrent connections, bounded one-MiB newline frames and read/write timeouts. The production dispatcher is tested through the real transport with a fake HomeKit backend. Python stdio output is protocol-only. There is no HTTP parser, CORS policy, socket proxy exposed over TCP, automatic updater, login service, external runtime package or HomeKit token export.
+One user-owned AF_UNIX endpoint, same-UID peer validation, four concurrent connections, bounded one-MiB newline frames and read/write timeouts. The production dispatcher is tested through the real transport with a fake HomeKit backend. Python stdio output is protocol-only. There is no HTTP parser, CORS policy, socket proxy exposed over TCP, automatic updater, external runtime package or HomeKit token export.
+
+## Background lifecycle
+
+The user's explicit login toggle registers only the main signed app through `SMAppService`. Startup never registers itself or overrides a disabled login item. No LaunchDaemon, privileged helper or external executable is installed. The status menu is an AppKit bundle embedded and signed with the app, loaded from a single fixed built-in path.
+
+Unattended resume requires a previous successful explicit start and a saved home scope, and always forces the runtime policy to read-only. Explicit Stop invalidates an in-flight startup, closes the endpoint and persists a pause. Quit preserves resume intent for the next app launch. No window disappearance handler stops the bridge. A private owned regular-file lock prevents multiple lifecycle owners. Status files contain phases, time, mode and PID, with a bounded transition journal; operation snapshots remain separate sensitive files. HomeKit authorization is checked on each backend read, including after recovery.
 
 ## Verification still requiring a real signed app
 
