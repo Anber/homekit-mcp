@@ -202,6 +202,12 @@ struct ContentView: View {
             }
             if let inventory = model.inventory {
                 Text("Allowed accessories (\(model.accessoryIDs.count) selected)").font(.headline)
+                HStack {
+                    Button("Select all current accessories") {
+                        model.accessoryIDs = Set(inventory.accessories.map(\.uuid))
+                    }
+                    Button("Clear selection") { model.accessoryIDs.removeAll() }
+                }.disabled(model.running || model.starting)
                 List(inventory.accessories, id: \.uuid) { accessory in
                     Toggle(isOn: Binding(
                         get: { model.accessoryIDs.contains(accessory.uuid) },

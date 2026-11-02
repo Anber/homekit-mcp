@@ -34,7 +34,7 @@ For initial provisioning, select your team in the app target's **Signing & Capab
 
 1. Build and sign the native app. Open `HomeKitMCP.app` yourself.
 2. Choose **Load homes** and grant the system HomeKit permission if you want this app to access your home.
-3. Select the intended home and check the accessories that may be inventoried/maintained. Leave metadata writes off initially. Save selection.
+3. Select the intended home and check the accessories that may be inventoried/maintained. **Select all current accessories** chooses the loaded inventory as a fixed UUID list; it never authorizes future devices automatically. Leave metadata writes off initially. Save selection.
 4. Choose **Start bridge**. Running requires both successful HomeKit inventory and socket setup.
 5. Inspect with the CLI:
 
