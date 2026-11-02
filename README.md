@@ -28,6 +28,8 @@ Tests compile the **same dispatcher/transport source files** used by the applica
 
 An unsigned build is for validation. For actual HomeKit use, build in Xcode with your own Apple development team and suitable provisioning, or run `make build-signed DEVELOPMENT_TEAM=YOUR_TEAM_ID`. In Xcode, assign the same team to the app and HomeKitMenu targets. This does not enable automatic provisioning updates or accept account agreements. Never reuse the upstream author's team identity. Inspect the signed bundle and nested menu signatures before granting access. Apple's login-item API also requires a code-signed app.
 
+For initial provisioning, select your team in the app target's **Signing & Capabilities → All** pane so Xcode can enable HomeKit on the iOS App ID and generate its Mac Catalyst profile too. HomeKit on the Mac requires Mac Catalyst; the app target must not also declare a native macOS destination. The menu bundle is a separate native macOS target. Do not remove the HomeKit entitlement to silence a provisioning failure. Keep profiles/private keys local; source control contains no team identity. Development certificates/profiles expire, so check their expiry before relying on unattended operation.
+
 ## First connection
 
 1. Build and sign the native app. Open `HomeKitMCP.app` yourself.
