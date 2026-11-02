@@ -197,7 +197,7 @@ struct ContentView: View {
                 Picker("Home", selection: $model.selectedHome) {
                     Text("Choose a home").tag("")
                     ForEach(model.homes, id: \.uuid) { Text($0.name).tag($0.uuid.uuidString) }
-                }.disabled(model.running || model.starting || model.loading)
+                }.pickerStyle(.segmented).disabled(model.running || model.starting || model.loading)
                     .onChange(of: model.selectedHome) { _ in model.selectHome() }
             }
             if let inventory = model.inventory {

@@ -20,8 +20,8 @@ import HomeKit
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
                 waiters[id] = continuation
                 Task { @MainActor [weak self] in
-                    try? await Task.sleep(nanoseconds: 10_000_000_000)
-                    self?.waiters.removeValue(forKey: id)?.resume(throwing: BridgeError("HomeKit is not ready; check local permission"))
+                    try? await Task.sleep(nanoseconds: 30_000_000_000)
+                    self?.waiters.removeValue(forKey: id)?.resume(throwing: BridgeError("Apple Home is still synchronizing or access is unavailable. Try Load homes again after checking access."))
                 }
             }
         }
