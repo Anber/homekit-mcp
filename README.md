@@ -1,194 +1,71 @@
-# HomeKit MCP ... and CLI ... and Room Plan/Apply script
+# HomeKit Local
 
-[![GitHub Release](https://img.shields.io/github/v/release/TimCinel/homekit-mcp?style=for-the-badge)](https://github.com/TimCinel/homekit-mcp/releases)
-[![GitHub Activity](https://img.shields.io/github/commit-activity/m/TimCinel/homekit-mcp?style=for-the-badge)](https://github.com/TimCinel/homekit-mcp/commits/main)
-[![License](https://img.shields.io/github/license/TimCinel/homekit-mcp?style=for-the-badge)](LICENSE)
-[![CI](https://img.shields.io/github/actions/workflow/status/TimCinel/homekit-mcp/ci.yml?style=for-the-badge&label=CI)](https://github.com/TimCinel/homekit-mcp/actions/workflows/ci.yml)
+A security-focused fork of [TimCinel/homekit-mcp](https://github.com/TimCinel/homekit-mcp), starting from commit `69d1ebb44d1fd52c2b5dd5e5e43092e484f284e4`.
 
-HTTP-based Model Context Protocol (MCP) server for HomeKit. Provides tools to list and manage HomeKit accessories and rooms.
+This fork maintains Apple Home **inventory, accessory names, room names and room assignments**. It does not expose light, lock, garage, cover-position or other actuator commands. Those functions belong to the user's existing automation system.
 
-Also a CLI for HomeKit.
+## Boundaries
 
-Also a script to help manage Home Assistant accessories across rooms, which is the actual motivation for all of this.
+- No HTTP or TCP listener. A native Mac Catalyst app owns a Unix-domain socket; a Python standard-library relay speaks MCP over stdio.
+- Runtime directory must be owned by the current user with mode `0700`; socket and policy/journal files are `0600`. The server verifies the peer UID. Processes running as your own macOS user are inside this trust boundary; this is not a sandbox against a compromised account.
+- No automatic HomeKit access, app launch, server startup, login item or package download. Launch the app and explicitly choose **Load homes** to request Apple Home access.
+- Default policy is read-only. With no selected home, only home names/UUIDs can be discovered. After selection, exactly one home and explicitly allowed accessory UUIDs are visible. New devices never join the allowlist automatically.
+- Metadata writes require a saved opt-in policy and exact UUIDs. Renaming a room additionally requires that room UUID in the editable-room allowlist. Requests carry expected old names/room UUIDs and an idempotency UUID.
+- The server saves a private pre-change journal before accepting a mutation. It returns `pending` immediately and verifies read-back before `succeeded`. An error or differing read-back is `unconfirmed`, blocks subsequent writes, and must be inspected. There is no automatic retry or false timeout-as-failure.
+- Completed request identities survive restart. Unresolved journals prevent restarting in write mode. Read-only inspection remains available. After inspecting current inventory, manually archive reviewed records to a private directory before enabling writes again. Do not delete a pending journal to make an uncertain operation disappear.
+- Stop closes the actual listener/connections and rejects queued, unaccepted writes. Previously accepted HomeKit operations may still complete. Their journal remains authoritative; stopping is not a rollback.
 
-This is implemented as a macOS app rather than a CLI tool because HomeKit requires a signed binary with proper entitlements that can only be achieved through an Xcode project.
+## Build and test
 
-## Prerequisites
+Requirements: macOS 13+, Python 3.9+, and Xcode with Mac Catalyst SDK/support installed. No third-party application dependencies.
 
-- macOS 13.0+ with HomeKit setup
-- Xcode (with Command Line Tools)
-- Apple ID (free tier sufficient for development)
-- HomeKit accessories configured in the Home app
-
-## Quick Start
-
-```bash
-git clone https://github.com/TimCinel/HomeKitSync.git
-cd HomeKitSync
-make build
-make run
-```
-
-The server will start on `http://localhost:8080`.
-
-Add to Claude Code:
-```bash
-claude mcp add --transport http homekit http://localhost:8080/mcp
-```
-
-## Available MCP Tools
-
-| Tool | Description | Parameters |
-|------|-------------|------------|
-| `get_all_accessories` | List all HomeKit accessories with names, rooms, categories, and UUIDs | None |
-| `get_all_rooms` | List all HomeKit rooms with names and UUIDs | None |
-| `set_accessory_room` | Move an accessory to a different room using UUIDs | `accessory_uuid`, `room_uuid` |
-| `get_accessory_by_name` | Find a HomeKit accessory by name | `name` |
-| `get_room_by_name` | Find a HomeKit room by name | `name` |
-| `set_accessory_room_by_name` | Move an accessory to a different room using names | `accessory_name`, `room_name` |
-| `rename_accessory` | Rename a HomeKit accessory | `accessory_name`, `new_name` |
-| `rename_room` | Rename a HomeKit room | `room_name`, `new_name` |
-| `get_room_accessories` | Get all accessories in a specific room | `room_name` |
-| `accessory_on` | Turn on an accessory (lights, switches) or open covers | `accessory_name` |
-| `accessory_off` | Turn off an accessory (lights, switches) or close covers | `accessory_name` |
-| `accessory_toggle` | Toggle an accessory between on/off or open/close | `accessory_name` |
-
-## Available CLI Tools
-
-### CLI Wrapper
-
-If you would rather script against the HTTP service directly, use the lightweight Python CLI in [scripts/homekitctl.py](scripts/homekitctl.py). It uses only the Python standard library, so it can run from non-macOS machines as long as they can reach the Mac host over HTTP.
-
-```bash
-scripts/homekitctl.py --server http://mac-mini.local:8080 rooms
-scripts/homekitctl.py --server http://mac-mini.local:8080 accessories
-scripts/homekitctl.py --server http://mac-mini.local:8080 find-accessory "Desk Lamp"
-scripts/homekitctl.py --server http://mac-mini.local:8080 move "Desk Lamp" Office
-scripts/homekitctl.py --server http://mac-mini.local:8080 on "Desk Lamp"
-```
-
-The CLI talks to `http://localhost:8080` by default. Override it with `--server` or `HOMEKIT_MCP_URL`:
-
-```bash
-python3 scripts/homekitctl.py --server http://localhost:8080 rooms
-HOMEKIT_MCP_URL=http://mac-mini.local:8080 python3 scripts/homekitctl.py tools
-```
-
-For anything not covered by the convenience commands, use raw tool calls:
-
-```bash
-scripts/homekitctl.py --server http://mac-mini.local:8080 call rename_room room_name=Office new_name=Study
-```
-
-### Room Manager - Plan and Apply
-
-It's kind of like Terraform but for your HomeKit?
-
-Features:
-* Use Room/Area from Home Assistant to assign rooms (plan and apply)
-* Back up current state snapshot in CSV
-* Edit state snapshot using text editor
-* Restore state snapshot using CSV
-
-> [!NOTE]
-> In both examples below, **HomeKitMCP.app** is running locally, and the details for Home Assistant
-> are provided in the env.
-
-Prereqs:
-
-```
-$ export HASS_TOKEN=eyJh...o
-$ export HASS_SERVER=https://assistant-home/
-$ export HOMEKIT_MCP_URL=http://localhost:8080
-...
-```
-
-Example plan/apply usage:
-
-```
-$ scripts/manage_homekit_rooms.py
-
-Wrote plan CSV: artifacts/homekit-plan-20260312-223133.csv
-Accessories scanned: 201
-Planned moves: 8
-Dry run only. Re-run with --apply to move accessories.
-
-$ ./manage_homekit_rooms.py --apply-plan artifacts/homekit-plan-20260312-223133.csv
-Loaded plan CSV: artifacts/homekit-plan-20260312-223133.csv
-Rows in plan: 99
-Planned moves: 8
-Moves applied: 8
-Wrote snapshot CSV: artifacts/homekit-snapshot-20260312-223725.csv
-```
-
-Example snapshot usage:
-
-```
-$ ./manage_homekit_rooms.py --restore artifacts/homekit-snapshot-20260312-223725.csv --apply
-Wrote plan CSV: artifacts/homekit-plan-20260312-224133.csv
-Accessories scanned: 201
-Planned moves: 1
-Moves applied: 1
-Wrote snapshot CSV: artifacts/homekit-snapshot-20260312-224133.csv
-```
-
-## Development
-
-### Testing
-
-Full test suite (requires HomeKit):
-```bash
+```sh
 make test
+make build-unsigned
 ```
 
-CI-friendly tests (no HomeKit dependency):
-```bash
-make test-ci
+Tests compile the **same dispatcher/transport source files** used by the application. The fixture executable does not import HomeKit and cannot access real devices. CI also builds the actual application; build failures are required failures, not ignored signing warnings.
+
+An unsigned build is for validation. For actual HomeKit use, build in Xcode with your own Apple development team and suitable provisioning, or run `make build-signed DEVELOPMENT_TEAM=YOUR_TEAM_ID`. This does not enable automatic provisioning updates or accept account agreements. Never reuse the upstream author's team identity. Inspect the signed bundle's entitlements before granting access.
+
+## First connection
+
+1. Build and sign the native app. Open `HomeKitMCP.app` yourself.
+2. Choose **Load homes** and grant the system HomeKit permission if you want this app to access your home.
+3. Select the intended home and check the accessories that may be inventoried/maintained. Leave metadata writes off initially. Save selection.
+4. Choose **Start bridge**. The status changes to Running only after successful socket setup.
+5. Inspect with the CLI:
+
+```sh
+python3 scripts/homekitctl.py accessories
+python3 scripts/homekitctl.py rooms
 ```
 
-### Code Quality
+For MCP, configure a local stdio server whose command is `/usr/bin/python3` and arguments are the absolute path to `scripts/homekitctl.py`, followed by `stdio`. The native app must already be running. The relay never launches it or requests HomeKit permission on your behalf. Protocol output is stdout; diagnostic errors are stderr. No bearer token or network port is needed.
 
-```bash
-make install-deps  # Install SwiftLint
-make lint
-make lint-fix      # Auto-fix issues
+Policy is in `~/Library/Application Support/HomeKitMCP/policy.json`; journals are in its `journal/` subdirectory. Policy changes take effect after Stop/Start. The current running policy is immutable.
+
+## Tools
+
+Read-only: `get_all_accessories`, `get_all_rooms`, `get_operation`. Initial unconfigured bootstrap only: `list_homes`.
+
+Opt-in metadata writes: `set_accessory_room`, `rename_accessory`, `rename_room`. All use `home_uuid`, a fresh `request_uuid`, target UUIDs, and expected old values. Read `tools/list` for the complete required JSON schemas. Repeating an identical request UUID returns the original operation; reusing it for different arguments is rejected. Query `get_operation` until an outcome is known. A `pending` result means accepted, not completed.
+
+`serial_number` is optional and is not read through deprecated HomeKit characteristics on Mac Catalyst. Use stable Apple Home accessory UUIDs and explicitly reviewed mappings to HA entities. Names are never used to locate mutation targets.
+
+## Reviewable room plans
+
+Create a desired JSON list of `{ "accessory_uuid": "...", "room_uuid": "..." }`, using the UUIDs from fresh allowed inventory. The source of that mapping can be a reviewed HA-area mapping; this helper never reads HA credentials, executes `hass-cli`, or guesses targets by name.
+
+```sh
+python3 scripts/manage_homekit_rooms.py plan --desired desired.json --output private-artifacts/plan.json
+python3 scripts/manage_homekit_rooms.py apply --plan private-artifacts/plan.json --plan-sha256 HASH_PRINTED_BY_PLAN --output-directory private-artifacts/results
 ```
 
-## API Reference
+Review the plan before applying its hash. Every row is checked against fresh inventory before the first write; duplicate semantic UUIDs and drift are rejected. A private pre-change snapshot is saved before any mutation. Each operation is verified and a pending/unconfirmed outcome stops the batch. There is no automatic bulk rollback: use the saved snapshot to construct a new inverse mapping, review it, and apply a fresh plan. Missing accessories or changed names/rooms require reconciliation, not an automatic override.
 
-### HTTP Endpoints
+## Compatibility and security scope
 
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| `GET` | `/mcp` | MCP server discovery |
-| `POST` | `/mcp/tools/list` | List available tools |
-| `POST` | `/mcp/tools/call` | Execute tools |
+The upstream HTTP endpoints, name-based commands, actuator tools, automatic startup, plaintext env-file workflow and post-change-only snapshots are intentionally removed. Update existing clients to the stdio relay.
 
-## Contributing
-
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Run tests (`make test-ci`) and linting (`make lint`)
-5. Submit a pull request
-
-## License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
-## Troubleshooting
-
-**"No such module 'HomeKit'"**
-- Ensure you're building for the correct target
-- Verify Xcode is properly installed
-
-**"App cannot run on the current OS version"**
-- Check deployment target in Xcode project settings
-
-**"HomeKit permissions denied"**
-- Verify HomeKit entitlement is enabled
-- Check Apple ID signing configuration
-
-**Server not reachable**
-- Ensure app is running and visible in Dock
-- Verify server logs in Console.app (search for "MCP") or run `log stream --info --process $(ps aux | grep MCP | grep -v grep | awk '{ print $2 }')`
+See [SECURITY.md](SECURITY.md) for the threat model and remaining validation boundaries. No public HomeKit endpoint is part of this architecture.

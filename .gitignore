@@ -1,3 +1,12 @@
-CLAUDE.md
-.build/
 build/
+.build/
+.swiftpm/
+DerivedData/
+.DS_Store
+__pycache__/
+*.pyc
+Local.xcconfig
+env.source
+artifacts/
+*.sock
+policy.json
