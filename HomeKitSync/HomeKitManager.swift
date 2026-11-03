@@ -1,143 +1,84 @@
 import Foundation
 import HomeKit
 
-class HomeKitManager: NSObject, ObservableObject, HMHomeManagerDelegate {
-    private let homeManager = HMHomeManager()
-    var outputHandler: ((String) -> Void)?
-    
-    override init() {
-        super.init()
-        homeManager.delegate = self
+@MainActor final class NativeHomeKitBackend: NSObject, HomeKitBackend, HMHomeManagerDelegate {
+    private let manager = HMHomeManager()
+    private var ready = false
+    private var waiters: [UUID: CheckedContinuation<Void, Error>] = [:]
+    override init() { super.init(); manager.delegate = self }
+    nonisolated func homeManagerDidUpdateHomes(_ manager: HMHomeManager) {
+        Task { @MainActor [weak self] in self?.markReady() }
     }
-    
-    func start() {
-        print("Starting HomeKit manager...")
-        outputHandler?("Starting HomeKit manager...")
+    private func markReady() {
+        ready = true
+        let pending = waiters; waiters.removeAll()
+        pending.values.forEach { $0.resume() }
     }
-    
-    func refresh() {
-        homeManagerDidUpdateHomes(homeManager)
-    }
-    
-    // MARK: - HMHomeManagerDelegate
-    
-    func homeManagerDidUpdateHomes(_ manager: HMHomeManager) {
-        print("HomeKit homes updated")
-        let message = getHomesAndContent()
-        outputHandler?(message)
-    }
-    
-    func homeManager(_ manager: HMHomeManager, didAdd home: HMHome) {
-        print("Home added: \(home.name)")
-        outputHandler?("Home added: \(home.name)")
-    }
-    
-    func homeManager(_ manager: HMHomeManager, didRemove home: HMHome) {
-        print("Home removed: \(home.name)")
-        outputHandler?("Home removed: \(home.name)")
-    }
-    
-    // MARK: - Listing Functions
-    
-    func getHomesAndContent() -> String {
-        var output = ""
-        
-        guard !homeManager.homes.isEmpty else {
-            return "No homes found"
-        }
-        
-        for home in homeManager.homes {
-            output += "\n🏠 Home: \(home.name)\n"
-            output += "   UUID: \(home.uniqueIdentifier)\n"
-            
-            output += getRooms(for: home)
-            output += getAccessories(for: home)
-        }
-        
-        return output
-    }
-    
-    func getRooms(for home: HMHome) -> String {
-        var output = "\n  📍 Rooms (\(home.rooms.count)):\n"
-        for room in home.rooms {
-            output += "    • \(room.name) (UUID: \(room.uniqueIdentifier))\n"
-        }
-        return output
-    }
-    
-    func getAccessories(for home: HMHome) -> String {
-        var output = "\n  🔌 Accessories (\(home.accessories.count)):\n"
-        for accessory in home.accessories {
-            let roomName = accessory.room?.name ?? "No Room"
-            output += "    • \(accessory.name)\n"
-            output += "      Room: \(roomName)\n"
-            output += "      UUID: \(accessory.uniqueIdentifier)\n"
-            output += "      Reachable: \(accessory.isReachable)\n"
-            
-            // List services
-            for service in accessory.services {
-                output += "      Service: \(service.serviceType) - \(service.name ?? "Unnamed")\n"
-            }
-            output += "\n"
-        }
-        return output
-    }
-    
-    // MARK: - Room Management Functions
-    
-    func moveAccessory(_ accessory: HMAccessory, to room: HMRoom, completion: @escaping (String) -> Void) {
-        guard let home = homeManager.homes.first(where: { $0.accessories.contains(accessory) }) else {
-            completion("❌ Could not find home for accessory \(accessory.name)")
-            return
-        }
-        
-        home.assignAccessory(accessory, to: room) { error in
-            if let error = error {
-                completion("❌ Failed to move \(accessory.name) to \(room.name): \(error.localizedDescription)")
-            } else {
-                completion("✅ Successfully moved \(accessory.name) to \(room.name)")
-            }
-        }
-    }
-    
-    func findAccessory(named name: String) -> HMAccessory? {
-        for home in homeManager.homes {
-            for accessory in home.accessories where accessory.name.lowercased().contains(name.lowercased()) {
-                return accessory
-            }
-        }
-        return nil
-    }
-    
-    func findRoom(named name: String) -> HMRoom? {
-        for home in homeManager.homes {
-            for room in home.rooms where room.name.lowercased().contains(name.lowercased()) {
-                return room
-            }
-        }
-        return nil
-    }
-    
-    // MARK: - Bulk Operations
-    
-    func moveAccessoriesMatching(pattern: String, to roomName: String) -> String {
-        guard let targetRoom = findRoom(named: roomName) else {
-            return "❌ Room '\(roomName)' not found"
-        }
-        
-        let matchingAccessories = homeManager.homes.flatMap { $0.accessories }
-            .filter { $0.name.lowercased().contains(pattern.lowercased()) }
-        
-        var output = "Moving \(matchingAccessories.count) accessories matching '\(pattern)' to '\(roomName)'\n\n"
-        
-        for accessory in matchingAccessories {
-            moveAccessory(accessory, to: targetRoom) { result in
-                DispatchQueue.main.async {
-                    self.outputHandler?(self.outputHandler == nil ? result : self.getHomesAndContent())
+    private func waitUntilReady() async throws {
+        if !ready {
+            let id = UUID()
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                waiters[id] = continuation
+                Task { @MainActor [weak self] in
+                    try? await Task.sleep(nanoseconds: 30_000_000_000)
+                    self?.waiters.removeValue(forKey: id)?.resume(throwing: BridgeError("Apple Home is still synchronizing or access is unavailable. Try Load homes again after checking access."))
                 }
             }
         }
-        
-        return output
+        guard manager.authorizationStatus.contains(.authorized) else { throw BridgeError("HomeKit permission is not authorized") }
+    }
+    func homes() async throws -> [HomeSummary] {
+        try await waitUntilReady()
+        return manager.homes.map { HomeSummary(uuid: $0.uniqueIdentifier, name: $0.name) }
+    }
+    private func home(_ id: UUID) async throws -> HMHome {
+        try await waitUntilReady()
+        guard let home = manager.homes.first(where: { $0.uniqueIdentifier == id })
+        else { throw BridgeError("Selected home is unavailable or access was denied") }
+        return home
+    }
+    func inventory(home id: UUID) async throws -> Inventory {
+        let selected = try await home(id)
+        var rooms = selected.rooms
+        let defaultRoom = selected.roomForEntireHome()
+        if !rooms.contains(where: { $0.uniqueIdentifier == defaultRoom.uniqueIdentifier }) { rooms.append(defaultRoom) }
+        return Inventory(home_uuid: id,
+            rooms: rooms.map { RoomRecord(uuid: $0.uniqueIdentifier, name: $0.name) },
+            accessories: selected.accessories.map { accessory in
+                return AccessoryRecord(uuid: accessory.uniqueIdentifier, name: accessory.name,
+                    room_uuid: accessory.room?.uniqueIdentifier ?? defaultRoom.uniqueIdentifier,
+                    category: accessory.category.categoryType)
+            })
+    }
+    func moveAccessory(home id: UUID, accessory accessoryID: UUID, room roomID: UUID) async throws {
+        let selected = try await home(id)
+        guard let accessory = selected.accessories.first(where: { $0.uniqueIdentifier == accessoryID }),
+              let room = (selected.rooms + [selected.roomForEntireHome()]).first(where: { $0.uniqueIdentifier == roomID })
+        else { throw BridgeError("Accessory and room must belong to the selected home") }
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            selected.assignAccessory(accessory, to: room) { error in
+                if let error { continuation.resume(throwing: error) } else { continuation.resume() }
+            }
+        }
+    }
+    func renameAccessory(home id: UUID, accessory accessoryID: UUID, name: String) async throws {
+        let selected = try await home(id)
+        guard let accessory = selected.accessories.first(where: { $0.uniqueIdentifier == accessoryID })
+        else { throw BridgeError("Accessory is not in the selected home") }
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            accessory.updateName(name) { error in
+                if let error { continuation.resume(throwing: error) } else { continuation.resume() }
+            }
+        }
+    }
+    func renameRoom(home id: UUID, room roomID: UUID, name: String) async throws {
+        let selected = try await home(id)
+        guard let room = selected.rooms.first(where: { $0.uniqueIdentifier == roomID })
+        else { throw BridgeError("Room is not editable in the selected home") }
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            room.updateName(name) { error in
+                if let error { continuation.resume(throwing: error) } else { continuation.resume() }
+            }
+        }
     }
 }

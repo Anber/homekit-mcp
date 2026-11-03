@@ -1,65 +1,17 @@
-# HomeKit MCP Server Makefile
+SWIFT_SCRATCH ?= .build
+.PHONY: test build build-unsigned build-signed
 
-.PHONY: build test test-ci lint lint-fix install-deps clean cli
-
-# Build the project
-build:
-	xcodebuild -project HomeKitSync.xcodeproj -scheme HomeKitSync -configuration Debug -destination 'platform=macOS,variant=Mac Catalyst' -allowProvisioningUpdates
-
-# Run tests (when test target is set up)
 test:
-	xcodebuild test -project HomeKitSync.xcodeproj -scheme HomeKitSync -destination 'platform=macOS,variant=Mac Catalyst'
+	swift test --scratch-path "$(SWIFT_SCRATCH)"
+	swift build --scratch-path "$(SWIFT_SCRATCH)" --product homekit-mcp-fixture
+	HOMEKIT_FIXTURE="$(abspath $(SWIFT_SCRATCH))/debug/homekit-mcp-fixture" python3 -m unittest discover -s Tests -p 'test_*.py' -v
 
-# Run CI-friendly tests (no dependencies, works anywhere)
-test-ci:
-	@echo "Running CI tests with Swift Package Manager..."
-	swift test
+build: build-unsigned
 
-# Run the lightweight CLI against the local HTTP server
-cli:
-	python3 scripts/homekitctl.py --help
+build-unsigned:
+	xcodebuild -project HomeKitSync.xcodeproj -scheme HomeKitSync -configuration Release -destination 'platform=macOS,variant=Mac Catalyst' -derivedDataPath .build/xcode CODE_SIGNING_ALLOWED=NO build
 
-# Install SwiftLint (requires Homebrew)
-install-deps:
-	@command -v brew >/dev/null 2>&1 || { echo "Homebrew is required. Install from https://brew.sh/"; exit 1; }
-	brew install swiftlint
-
-# Run SwiftLint
-lint:
-	@command -v swiftlint >/dev/null 2>&1 || { echo "SwiftLint not found. Run 'make install-deps' first."; exit 1; }
-	swiftlint
-
-# Fix SwiftLint issues automatically
-lint-fix:
-	@command -v swiftlint >/dev/null 2>&1 || { echo "SwiftLint not found. Run 'make install-deps' first."; exit 1; }
-	swiftlint --fix
-
-# Clean build artifacts
-clean:
-	xcodebuild clean -project HomeKitSync.xcodeproj -scheme HomeKitSync
-
-# Run the built app
-run:
-	@echo "Looking for built app..."
-	@APP_PATH=$$(find ~/Library/Developer/Xcode/DerivedData -name "HomeKitMCP.app" -path "*/Debug-maccatalyst/*" 2>/dev/null | head -1); \
-	if [ -n "$$APP_PATH" ]; then \
-		echo "Starting HomeKit MCP Server..."; \
-		open -a "$$APP_PATH"; \
-	else \
-		echo "App not found. Run 'make build' first."; \
-		exit 1; \
-	fi
-
-# Show help
-help:
-	@echo "Available commands:"
-	@echo "  build        - Build the HomeKit MCP Server"
-	@echo "  test         - Run unit tests (requires HomeKit/Mac Catalyst)"
-	@echo "  test-ci      - Run CI-friendly tests (no dependencies)"
-	@echo "  cli          - Show Python CLI help for the HTTP wrapper"
-	@echo "  lint         - Run SwiftLint checks"
-	@echo "  lint-fix     - Fix SwiftLint issues automatically"
-	@echo "  install-deps - Install SwiftLint via Homebrew"
-	@echo "  run          - Run the built app"
-	@echo "  clean        - Clean build artifacts"
-	@echo "  help         - Show this help message"
+# Explicit local signing only; no automatic provisioning/account changes.
+build-signed:
+	@test -n "$(DEVELOPMENT_TEAM)" || { echo 'Set DEVELOPMENT_TEAM to your own Apple team ID'; exit 1; }
+	xcodebuild -project HomeKitSync.xcodeproj -scheme HomeKitSync -configuration Release -destination 'platform=macOS,variant=Mac Catalyst' -derivedDataPath .build/xcode DEVELOPMENT_TEAM=$(DEVELOPMENT_TEAM) build

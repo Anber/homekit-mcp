@@ -21,8 +21,15 @@
 	<key>LSMinimumSystemVersion</key>
 	<string>$(MACOSX_DEPLOYMENT_TARGET)</string>
 	<key>LSUIElement</key>
+	<true/>
+	<key>NSSupportsAutomaticTermination</key>
 	<false/>
+	<key>UIApplicationSceneManifest</key>
+	<dict>
+		<key>UIApplicationSupportsMultipleScenes</key>
+		<true/>
+	</dict>
 	<key>NSHomeKitUsageDescription</key>
-	<string>HomeKitMCP needs access to your HomeKit accessories to provide MCP server functionality.</string>
+	<string>HomeKit Local inventories only your selected home and accessories. Changes to names and rooms require explicit opt-in; this app has no actuator commands.</string>
 </dict>
 </plist>

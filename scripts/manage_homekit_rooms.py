@@ -1,384 +1,161 @@
 #!/usr/bin/env python3
-
+"""Reviewable UUID room plans; no HA tokens, external commands or name matching."""
 import argparse
-import csv
+import fcntl
+import hashlib
 import json
 import os
-import subprocess
-import sys
-from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
-from typing import Dict, Iterable, List, Tuple
+import stat
+import sys
+import time
+import uuid
+
+from homekitctl import BridgeError, Client, DEFAULT_SOCKET
 
 
-DEFAULT_OUTPUT_DIR = "artifacts"
-UNKNOWN_SERIALS = {"", "Unknown", "unknown", "UNKNOWN"}
+def private_directory(path):
+    path = Path(path)
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    mode = path.lstat()
+    if not stat.S_ISDIR(mode.st_mode) or mode.st_uid != os.geteuid() or mode.st_mode & 0o077:
+        raise BridgeError("Output directory must be an owned private directory (0700)")
+    return path
 
 
-@dataclass
-class Accessory:
-    name: str
-    serial: str
-    room: str
-    uuid: str
+def private_json(path, value):
+    path = Path(path)
+    private_directory(path.parent)
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "w") as target:
+        json.dump(value, target, ensure_ascii=False, indent=2)
+        target.write("\n")
+        target.flush()
+        os.fsync(target.fileno())
+        if sys.platform == "darwin":
+            fcntl.fcntl(target.fileno(), fcntl.F_FULLFSYNC)
+        directory_fd = os.open(str(path.parent), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            os.fsync(directory_fd)
+            if sys.platform == "darwin":
+                fcntl.fcntl(target.fileno(), fcntl.F_FULLFSYNC)
+        finally:
+            os.close(directory_fd)
 
 
-@dataclass
-class PlanRow:
-    name: str
-    serial: str
-    current_room: str
-    target_room: str
-    reason: str
+def digest(value):
+    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()).hexdigest()
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Plan and apply HomeKit room moves using homekitctl and hass-cli."
-    )
-    parser.add_argument("--input-csv", help="Optional CSV with columns name,serial,room.")
-    parser.add_argument(
-        "--restore",
-        help="Restore from a saved snapshot CSV with columns name,serial,room. Alias for --input-csv.",
-    )
-    parser.add_argument(
-        "--apply",
-        action="store_true",
-        help="Apply planned room moves via homekitctl move.",
-    )
-    parser.add_argument(
-        "--apply-plan",
-        help="Apply an existing plan CSV with columns name,serial,current_room,target_room,reason.",
-    )
-    parser.add_argument(
-        "--output-dir",
-        default=DEFAULT_OUTPUT_DIR,
-        help=f"Directory for generated CSV files. Default: {DEFAULT_OUTPUT_DIR}",
-    )
-    parser.add_argument(
-        "--env-file",
-        default="env.source",
-        help="Optional shell-style env file with lines like export KEY=value.",
-    )
-    return parser.parse_args()
+def inventory(client):
+    accessories = client.call("get_all_accessories")
+    rooms = client.call("get_all_rooms")
+    if accessories["home_uuid"] != rooms["home_uuid"]:
+        raise BridgeError("Inventory home mismatch")
+    return {"home_uuid": accessories["home_uuid"], "accessories": accessories["accessories"], "rooms": rooms["rooms"]}
 
 
-def load_env_file(path: Path) -> Dict[str, str]:
-    loaded: Dict[str, str] = {}
-    if not path.exists():
-        return loaded
-
-    for raw_line in path.read_text(encoding="utf-8").splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
-            continue
-        if line.startswith("export "):
-            line = line[len("export ") :]
-        if "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        loaded[key.strip()] = value.strip()
-    return loaded
-
-
-def cleaned_env(env_file: str) -> Dict[str, str]:
-    env = os.environ.copy()
-    env.update(load_env_file(Path(env_file)))
-    env.pop("LC_ALL", None)
-    env["LANG"] = env.get("LANG") or "en_AU.UTF-8"
-    env["LC_CTYPE"] = env.get("LC_CTYPE") or env["LANG"]
-    return env
-
-
-def run_json(command: List[str], env: Dict[str, str]) -> object:
-    proc = subprocess.run(command, capture_output=True, text=True, env=env)
-    if proc.returncode != 0:
-        raise RuntimeError(
-            f"Command failed ({proc.returncode}): {' '.join(command)}\n{proc.stderr.strip()}"
-        )
-
-    try:
-        return json.loads(proc.stdout)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(
-            f"Command did not return JSON: {' '.join(command)}\n{proc.stdout[:500]}"
-        ) from exc
-
-
-def run_text(command: List[str], env: Dict[str, str]) -> str:
-    proc = subprocess.run(command, capture_output=True, text=True, env=env)
-    if proc.returncode != 0:
-        raise RuntimeError(
-            f"Command failed ({proc.returncode}): {' '.join(command)}\n{proc.stderr.strip()}"
-        )
-    return proc.stdout
-
-
-def get_homekit_accessories(env: Dict[str, str]) -> List[Accessory]:
-    payload = run_json(["homekitctl", "--json", "accessories"], env)
-    items = payload["result"]["_meta"]["accessories"]
-    return [
-        Accessory(
-            name=item.get("name", ""),
-            serial=item.get("serial_number", "") or "",
-            room=item.get("room", "") or "",
-            uuid=item.get("uuid", "") or "",
-        )
-        for item in items
-    ]
-
-
-def get_homekit_rooms(env: Dict[str, str]) -> List[str]:
-    payload = run_json(["homekitctl", "--json", "rooms"], env)
-    items = payload["result"]["_meta"]["rooms"]
-    return sorted(item.get("name", "") for item in items if item.get("name"))
-
-
-def get_ha_registry(kind: str, env: Dict[str, str]) -> List[dict]:
-    payload = run_json(["hass-cli", "-o", "json", "raw", "ws", kind], env)
-    if isinstance(payload, dict) and isinstance(payload.get("result"), list):
-        return payload["result"]
-    raise RuntimeError(f"Unexpected hass-cli output for {kind}")
-
-
-def load_ha_entity_data(env: Dict[str, str]) -> Tuple[set[str], Dict[str, str]]:
-    entity_registry = get_ha_registry("config/entity_registry/list", env)
-    device_registry = get_ha_registry("config/device_registry/list", env)
-    area_registry = get_ha_registry("config/area_registry/list", env)
-
-    area_by_id = {item["area_id"]: item["name"] for item in area_registry if item.get("area_id")}
-    device_area_by_id = {
-        item["id"]: area_by_id.get(item.get("area_id"), "")
-        for item in device_registry
-        if item.get("id")
-    }
-
-    entity_ids: set[str] = set()
-    room_by_entity: Dict[str, str] = {}
-    for entity in entity_registry:
-        entity_id = entity.get("entity_id")
-        if not entity_id:
-            continue
-        entity_ids.add(entity_id)
-
-        area_name = area_by_id.get(entity.get("area_id"), "")
-        if not area_name:
-            area_name = device_area_by_id.get(entity.get("device_id"), "")
-        if area_name:
-            room_by_entity[entity_id] = area_name
-    return entity_ids, room_by_entity
-
-
-def is_known_serial(serial: str) -> bool:
-    return serial not in UNKNOWN_SERIALS
-
-
-def load_csv_rows(path: Path) -> List[dict]:
-    with path.open(newline="", encoding="utf-8") as handle:
-        rows = list(csv.DictReader(handle))
-    required = {"name", "serial", "room"}
-    if not rows:
-        return []
-    missing = required - set(rows[0].keys())
-    if missing:
-        raise RuntimeError(f"CSV {path} is missing columns: {', '.join(sorted(missing))}")
-    return rows
-
-
-def load_plan_rows(path: Path) -> List[PlanRow]:
-    with path.open(newline="", encoding="utf-8") as handle:
-        rows = list(csv.DictReader(handle))
-
-    required = {"name", "serial", "current_room", "target_room", "reason"}
-    if not rows:
-        return []
-    missing = required - set(rows[0].keys())
-    if missing:
-        raise RuntimeError(f"Plan CSV {path} is missing columns: {', '.join(sorted(missing))}")
-
-    return [
-        PlanRow(
-            name=row.get("name", "") or "",
-            serial=row.get("serial", "") or "",
-            current_room=row.get("current_room", "") or "",
-            target_room=row.get("target_room", "") or "",
-            reason=row.get("reason", "") or "",
-        )
-        for row in rows
-    ]
-
-
-def key_for_row(name: str, serial: str) -> Tuple[str, str]:
-    if is_known_serial(serial):
-        return ("serial", serial)
-    return ("name", name)
-
-
-def build_loaded_room_map(rows: Iterable[dict]) -> Dict[Tuple[str, str], str]:
-    loaded: Dict[Tuple[str, str], str] = {}
-    for row in rows:
-        loaded[key_for_row(row.get("name", ""), row.get("serial", ""))] = row.get("room", "") or ""
-    return loaded
-
-
-def merge_reason(existing: str, new_reason: str) -> str:
-    parts = [part for part in existing.split(";") if part]
-    if new_reason not in parts:
-        parts.append(new_reason)
-    return ";".join(parts)
-
-
-def build_plan(
-    accessories: List[Accessory],
-    loaded_room_map: Dict[Tuple[str, str], str],
-    ha_entity_ids: set[str],
-    ha_room_map: Dict[str, str],
-    valid_rooms: set[str],
-) -> List[PlanRow]:
-    plan: List[PlanRow] = []
-
-    for accessory in accessories:
-        key = key_for_row(accessory.name, accessory.serial)
-        target_room = ""
-        reason = ""
-
-        loaded_room = loaded_room_map.get(key, "")
-        if loaded_room:
-            target_room = loaded_room
-            reason = merge_reason(reason, "loaded-csv")
-
-        if is_known_serial(accessory.serial):
-            ha_room = ha_room_map.get(accessory.serial, "")
-            in_homeassistant = accessory.serial in ha_entity_ids
-            if ha_room and ha_room in valid_rooms and not target_room:
-                target_room = ha_room
-                reason = merge_reason(reason, "homeassistant-room")
-            elif ha_room and ha_room in valid_rooms:
-                reason = merge_reason(reason, "homeassistant-room")
-            elif ha_room:
-                reason = merge_reason(reason, "homeassistant-room-no-homekit-match")
-            elif in_homeassistant:
-                reason = merge_reason(reason, "homeassistant-no-room")
-            else:
-                reason = merge_reason(reason, "not-homeassistant")
-        else:
-            reason = merge_reason(reason, "not-homeassistant")
-
-        plan.append(
-            PlanRow(
-                name=accessory.name,
-                serial=accessory.serial,
-                current_room=accessory.room,
-                target_room=target_room,
-                reason=reason,
-            )
-        )
-
+def validate_plan(plan, current):
+    if set(plan) != {"schema_version", "home_uuid", "moves"} or plan["schema_version"] != 1:
+        raise BridgeError("Unsupported plan")
+    if uuid.UUID(plan["home_uuid"]) != uuid.UUID(current["home_uuid"]) or not isinstance(plan["moves"], list):
+        raise BridgeError("Plan belongs to another home")
+    accessories = {uuid.UUID(x["uuid"]): x for x in current["accessories"]}
+    rooms = {uuid.UUID(x["uuid"]) for x in current["rooms"]}
+    seen = set()
+    requests = set()
+    for move in plan["moves"]:
+        if set(move) != {"accessory_uuid", "room_uuid", "expected_name", "expected_room_uuid", "request_uuid"}:
+            raise BridgeError("Exact UUID-based move fields required")
+        identifiers = {key: uuid.UUID(move[key]) for key in
+                       ["accessory_uuid", "room_uuid", "expected_room_uuid", "request_uuid"]}
+        key = identifiers["accessory_uuid"]
+        if key in seen:
+            raise BridgeError("Duplicate accessory in plan")
+        if identifiers["request_uuid"] in requests:
+            raise BridgeError("Duplicate request UUID in plan")
+        seen.add(key)
+        requests.add(identifiers["request_uuid"])
+        actual = accessories.get(key)
+        if actual is None or actual["name"] != move["expected_name"] or uuid.UUID(actual["room_uuid"]) != identifiers["expected_room_uuid"]:
+            raise BridgeError("Stale plan or accessory outside policy; regenerate the whole plan")
+        if identifiers["room_uuid"] not in rooms:
+            raise BridgeError("Target room is not in the selected home")
     return plan
 
 
-def timestamp() -> str:
-    return datetime.now().strftime("%Y%m%d-%H%M%S")
+def make_plan(current, desired):
+    if not isinstance(desired, list):
+        raise BridgeError("Desired mapping must be a list of accessory_uuid/room_uuid objects")
+    by_id = {uuid.UUID(x["uuid"]): x for x in current["accessories"]}
+    moves = []
+    seen = set()
+    for entry in desired:
+        if set(entry) != {"accessory_uuid", "room_uuid"} or uuid.UUID(entry["accessory_uuid"]) not in by_id:
+            raise BridgeError("Mapping must use allowed accessory UUIDs and room UUIDs")
+        accessory = uuid.UUID(entry["accessory_uuid"])
+        if accessory in seen:
+            raise BridgeError("Duplicate accessory in desired mapping")
+        seen.add(accessory)
+        actual = by_id[accessory]
+        if uuid.UUID(actual["room_uuid"]) != uuid.UUID(entry["room_uuid"]):
+            moves.append({"accessory_uuid": actual["uuid"], "room_uuid": str(uuid.UUID(entry["room_uuid"])).upper(),
+                          "expected_name": actual["name"], "expected_room_uuid": actual["room_uuid"],
+                          "request_uuid": str(uuid.uuid4())})
+    return validate_plan({"schema_version": 1, "home_uuid": current["home_uuid"], "moves": moves}, current)
 
 
-def write_plan_csv(path: Path, rows: List[PlanRow]) -> None:
-    with path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(
-            handle,
-            fieldnames=["name", "serial", "current_room", "target_room", "reason"],
-        )
-        writer.writeheader()
-        for row in rows:
-            writer.writerow(
-                {
-                    "name": row.name,
-                    "serial": row.serial,
-                    "current_room": row.current_room,
-                    "target_room": row.target_room,
-                    "reason": row.reason,
-                }
-            )
+def apply_plan(client, plan, expected_hash, output, wait_seconds=20):
+    if digest(plan) != expected_hash:
+        raise BridgeError("Plan hash changed after review")
+    before = inventory(client)
+    validate_plan(plan, before)  # Check every row before the first mutation.
+    output = private_directory(output)
+    snapshot = output / ("before-" + str(uuid.uuid4()) + ".json")
+    private_json(snapshot, before)  # Failure here prevents all writes.
+    results = []
+    for move in plan["moves"]:
+        arguments = dict(move, home_uuid=plan["home_uuid"])
+        operation = client.call("set_accessory_room", arguments)
+        deadline = time.monotonic() + wait_seconds
+        while operation["status"] == "pending" and time.monotonic() < deadline:
+            time.sleep(0.05)
+            operation = client.call("get_operation", {"operation_uuid": operation["operation_uuid"]})
+        results.append(operation)
+        private_json(output / ("result-" + str(uuid.uuid4()) + ".json"), operation)
+        if operation["status"] != "succeeded":
+            raise BridgeError("Operation pending/unconfirmed; stop and inspect its journal and inventory. Do not re-submit with a new request_uuid.")
+    after = inventory(client)
+    actual_rooms = {uuid.UUID(x["uuid"]): uuid.UUID(x["room_uuid"]) for x in after["accessories"]}
+    if any(actual_rooms.get(uuid.UUID(move["accessory_uuid"])) != uuid.UUID(move["room_uuid"]) for move in plan["moves"]):
+        raise BridgeError("Final room assignments do not match the plan")
+    return {"snapshot": str(snapshot), "verified_moves": len(results), "operations": results}
 
 
-def write_snapshot_csv(path: Path, accessories: List[Accessory]) -> None:
-    with path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=["name", "serial", "room"])
-        writer.writeheader()
-        for item in accessories:
-            writer.writerow({"name": item.name, "serial": item.serial, "room": item.room})
-
-
-def apply_moves(rows: List[PlanRow], valid_rooms: set[str], env: Dict[str, str]) -> int:
-    moves = 0
-    for row in rows:
-        if not row.target_room or row.current_room == row.target_room:
-            continue
-        if row.target_room not in valid_rooms:
-            print(
-                f"Skipping '{row.name}': target room '{row.target_room}' does not exist in HomeKit",
-                file=sys.stderr,
-            )
-            continue
-
-        run_text(["homekitctl", "move", row.name, row.target_room], env)
-        moves += 1
-    return moves
-
-
-def main() -> int:
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--socket", type=Path, default=DEFAULT_SOCKET)
+    sub = parser.add_subparsers(dest="command", required=True)
+    plan_parser = sub.add_parser("plan")
+    plan_parser.add_argument("--desired", type=Path, required=True)
+    plan_parser.add_argument("--output", type=Path, required=True)
+    apply_parser = sub.add_parser("apply")
+    apply_parser.add_argument("--plan", type=Path, required=True)
+    apply_parser.add_argument("--plan-sha256", required=True)
+    apply_parser.add_argument("--output-directory", type=Path, required=True)
+    args = parser.parse_args(argv)
     try:
-        args = parse_args()
-        env = cleaned_env(args.env_file)
-
-        output_dir = Path(args.output_dir)
-        output_dir.mkdir(parents=True, exist_ok=True)
-
-        stamp = timestamp()
-        rooms = set(get_homekit_rooms(env))
-
-        if args.apply_plan:
-            plan_path = Path(args.apply_plan)
-            plan = load_plan_rows(plan_path)
-            move_candidates = [row for row in plan if row.target_room]
-            print(f"Loaded plan CSV: {plan_path}")
-            print(f"Rows in plan: {len(plan)}")
-            print(f"Planned moves: {len(move_candidates)}")
-            moves = apply_moves(plan, rooms, env)
-        else:
-            input_csv = args.restore or args.input_csv
-            loaded_rows = load_csv_rows(Path(input_csv)) if input_csv else []
-            accessories = get_homekit_accessories(env)
-
-            loaded_room_map = build_loaded_room_map(loaded_rows)
-            ha_entity_ids, ha_room_map = load_ha_entity_data(env)
-            plan = build_plan(accessories, loaded_room_map, ha_entity_ids, ha_room_map, rooms)
-            plan = [row for row in plan if row.current_room != row.target_room]
-
-            plan_path = output_dir / f"homekit-plan-{stamp}.csv"
-            write_plan_csv(plan_path, plan)
-
-            move_candidates = [row for row in plan if row.target_room]
-
-            print(f"Wrote plan CSV: {plan_path}")
-            print(f"Accessories scanned: {len(accessories)}")
-            print(f"Planned moves: {len(move_candidates)}")
-
-            if not args.apply:
-                print("Dry run only. Re-run with --apply to move accessories.")
-                return 0
-
-            moves = apply_moves(plan, rooms, env)
-
-        final_accessories = get_homekit_accessories(env)
-        snapshot_path = output_dir / f"homekit-snapshot-{stamp}.csv"
-        write_snapshot_csv(snapshot_path, final_accessories)
-
-        print(f"Moves applied: {moves}")
-        print(f"Wrote snapshot CSV: {snapshot_path}")
+        with Client(args.socket) as client:
+            if args.command == "plan":
+                value = make_plan(inventory(client), json.loads(args.desired.read_text()))
+                private_json(args.output, value)
+                result = {"plan": str(args.output), "sha256": digest(value), "moves": len(value["moves"])}
+            else:
+                result = apply_plan(client, json.loads(args.plan.read_text()), args.plan_sha256, args.output_directory)
+        print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0
-    except RuntimeError as exc:
-        print(str(exc), file=sys.stderr)
+    except (BridgeError, OSError, ValueError, KeyError, TypeError) as error:
+        print(str(error), file=sys.stderr)
         return 1
 
 

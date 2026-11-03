@@ -1,71 +1,25 @@
 name: CI
-
 on:
   push:
-    branches: [ main, master, develop ]
+    branches: [master]
   pull_request:
-    branches: [ main, master ]
+    branches: [master]
   workflow_dispatch:
-  schedule:
-    - cron: "0 0 * * *"  # Daily at midnight UTC
-
+permissions:
+  contents: read
+concurrency:
+  group: homekit-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
 jobs:
-  lint:
-    name: Lint
-    runs-on: macos-latest
-    
+  verify:
+    name: Security, background lifecycle and native build
+    # GitHub's arm64 pool can fail before allocating a runner. Build a universal
+    # app on the Intel pool; production/fixture code is unchanged.
+    runs-on: macos-26-intel
+    timeout-minutes: 15
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-      
-    - name: Install SwiftLint
-      run: brew install swiftlint
-    
-    - name: Run SwiftLint
-      run: make lint
-
-  test-macos:
-    name: Test (macOS)
-    runs-on: macos-latest
-    
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-      
-    # Use system Swift on macOS
-    - name: Run CI Tests
-      run: |
-        echo "Swift version:"
-        swift --version
-        echo "Running tests..."
-        make test-ci
-      
-    - name: Validate Swift Package
-      run: |
-        swift package describe
-        swift build
-
-
-  build-validation:
-    name: Build Validation
-    runs-on: macos-latest
-    
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-      
-    - name: Setup Xcode
-      uses: maxim-lobanov/setup-xcode@v1
-      with:
-        xcode-version: latest-stable
-        
-    - name: Validate Xcode Project
-      run: |
-        xcodebuild -list
-        xcodebuild -project HomeKitSync.xcodeproj -scheme HomeKitSync -destination 'platform=macOS,variant=Mac Catalyst' -dry-run
-      continue-on-error: true  # HomeKit signing issues expected in CI
-      
-    - name: Check Project Structure
-      run: |
-        ls -la
-        find . -name "*.swift" | head -10
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Production core and local transport tests (no HomeKit)
+        run: make test
+      - name: Build actual Mac Catalyst application without signing or execution
+        run: make build-unsigned
